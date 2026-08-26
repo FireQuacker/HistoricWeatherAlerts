@@ -3,6 +3,7 @@ import urllib.parse
 from datetime import datetime
 import pytz
 from timezonefinder import TimezoneFinder
+import streamlit as st
 
 def geocode_location(city: str, state: str) -> dict:
     """Geocodes a City and State using the free Nominatim (OpenStreetMap) API."""
@@ -94,40 +95,65 @@ def check_historical_heat_advisories(lat: float, lon: float, target_date_str: st
                 
     return active_heat_events
 
-
 # ==========================================
-# CLI TESTING INTERFACE (Run this directly)
+# STREAMLIT USER INTERFACE
 # ==========================================
-if __name__ == "__main__":
-    print("--- Historical Heat Advisory Checker ---")
-    city_input = input("Enter City (e.g., Phoenix): ")
-    state_input = input("Enter State (e.g., AZ): ")
-    date_input = input("Enter Target Date (YYYY-MM-DD): ")
+def main():
+    st.set_page_config(page_title="Historical Heat Advisory Checker", page_icon="🚨", layout="centered")
     
-    print("\n1. Resolving coordinates...")
-    geo_data = geocode_location(city_input, state_input)
+    st.title("🚨 Historical Heat Advisory Checker")
+    st.markdown("Query the **National Weather Service archives (IEM API)** for active heat events on a specific date.")
     
-    if "error" in geo_data:
-        print(f"Error: {geo_data['error']}")
-    else:
+    # Create the search form using Streamlit inputs
+    with st.form("heat_search_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            city_input = st.text_input("Enter City", value="Phoenix")
+        with col2:
+            state_input = st.text_input("Enter State (e.g., AZ)", value="AZ")
+        
+        date_input = st.date_input("Select Target Date")
+        submit_button = st.form_submit_button("Search Historical Alerts")
+        
+    if submit_button:
+        if not city_input or not state_input:
+            st.error("Please enter both a City and State.")
+            return
+            
+        # Convert the Streamlit date object back to a string for the underlying function
+        date_str = date_input.strftime("%Y-%m-%d")
+        
+        with st.spinner("Resolving coordinates..."):
+            geo_data = geocode_location(city_input, state_input)
+            
+        if "error" in geo_data:
+            st.error(f"Error: {geo_data['error']}")
+            return
+            
         lat = geo_data['latitude']
         lon = geo_data['longitude']
-        print(f"   Found Location: {geo_data['display_name']}")
-        print(f"   Coordinates: {lat}, {lon}")
         
-        print("\n2. Checking National Weather Service archives (IEM API)...")
-        results = check_historical_heat_advisories(lat, lon, date_input)
+        st.success(f"**Found Location:** {geo_data['display_name']}")
+        st.info(f"**Coordinates:** Lat {lat}, Lon {lon}")
         
-        print("\n--- RESULTS ---")
+        with st.spinner("Checking NWS archives (IEM API)..."):
+            results = check_historical_heat_advisories(lat, lon, date_str)
+            
+        st.divider()
+        st.subheader("--- RESULTS ---")
+        
         if not results:
-            print(f"No Heat Advisories or Excessive Heat Warnings found for this location on {date_input}.")
+            st.info(f"No Heat Advisories or Excessive Heat Warnings found for this location on {date_str}.")
         elif "error" in results[0]:
-            print(results[0]["error"])
+            st.error(results[0]["error"])
         else:
-            print(f"Found {len(results)} active heat event(s) on {date_input}:")
+            st.warning(f"Found {len(results)} active heat event(s) on {date_str}:")
             for event in results:
-                print(f"  - 🚨 {event['event_name']}")
-                print(f"       Issued By: NWS {event['nws_office']}")
-                print(f"       Active From: {event['issued_local']}")
-                print(f"       Active To:   {event['expired_local']}")
-                print(f"       Event ID:    {event['event_id']}\n")
+                with st.expander(f"🚨 {event['event_name']}", expanded=True):
+                    st.write(f"**Issued By:** NWS {event['nws_office']}")
+                    st.write(f"**Active From:** {event['issued_local']}")
+                    st.write(f"**Active To:** {event['expired_local']}")
+                    st.write(f"**Event ID:** {event['event_id']}")
+
+if __name__ == "__main__":
+    main()
