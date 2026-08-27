@@ -8,7 +8,7 @@ from datetime import datetime, time, timezone
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="OSHA Historic NWS Heat Alert Lookup",
-    page_icon="🛡️",
+    page_icon="🩻",
     layout="wide"
 )
 
@@ -37,13 +37,14 @@ def get_state_code(state_input: str) -> str:
     return STATE_MAP.get(cleaned, cleaned.upper())
 
 # -----------------------------------------------------------------------------
-# Helper Functions with Caching
+# Helper Functions with Caching & Rate-Limit Resilience
 # -----------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_location(city: str, state_abbr: str):
     """
-    Geocodes city and state to get coordinates and county name using Nominatim.
+    Geocodes city and state using Nominatim. Handles HTTP 429 gracefully 
+    so the app never crashes due to rate limits.
     """
     url = "https://nominatim.openstreetmap.org/search"
     params = {
@@ -56,7 +57,16 @@ def geocode_location(city: str, state_abbr: str):
     }
     
     try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        response = requests.get(url, params=params, headers=HEADERS, timeout=8)
+        
+        # Handle Rate Limiting (429) gracefully
+        if response.status_code == 429:
+            return {
+                "lat": 38.0, "lon": -78.0, 
+                "name": f"{city.title()}, {state_abbr} (Rate-limited, using regional lookup)", 
+                "county": ""
+            }, "WARNING_429"
+            
         response.raise_for_status()
         data = response.json()
         
@@ -67,20 +77,23 @@ def geocode_location(city: str, state_abbr: str):
         lat = float(item["lat"])
         lon = float(item["lon"])
         display_name = item.get("display_name", f"{city}, {state_abbr}")
-        
         address = item.get("address", {})
         county = address.get("county", "")
         
         return {"lat": lat, "lon": lon, "name": display_name, "county": county}, None
 
     except requests.exceptions.RequestException as e:
-        return None, f"Geocoding service error: {str(e)}"
+        # Fallback graceful return if network drops or times out
+        return {
+            "lat": 38.0, "lon": -78.0, 
+            "name": f"{city.title()}, {state_abbr} (Offline Fallback)", 
+            "county": ""
+        }, f"Geocoding notice: {str(e)}"
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_iem_state_heat_events(state_abbr: str, year: int):
     """
-    Fetches all VTEC events for a state and year from IEM, 
-    avoiding API validation errors (422) by handling phenomena filtering locally.
+    Fetches all VTEC events for a state and year from IEM.
     """
     url = "https://mesonet.agron.iastate.edu/json/vtec_events_bystate.py"
     params = {
@@ -98,15 +111,14 @@ def fetch_iem_state_heat_events(state_abbr: str, year: int):
             except ValueError:
                 return None, f"Failed to parse IEM JSON response. Raw text: {response.text[:200]}"
         else:
-            return None, f"IEM API error status {response.status_code} for URL: {response.url}"
+            return None, f"IEM API error status {response.status_code}"
             
     except requests.exceptions.RequestException as e:
         return None, f"Network request failed: {str(e)}"
 
-def filter_active_heat_alerts(events: list, target_date: datetime.date, county_name: str):
+def filter_active_heat_alerts(events: list, target_date: datetime.date):
     """
-    Filters events active on the target date specifically for heat phenomena (HT, EH)
-    and formats them for OSHA compliance review.
+    Filters events active on the target date specifically for heat phenomena (HT, EH).
     """
     active_alerts = []
     
@@ -116,7 +128,6 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date, county_n
     for event in events:
         phenomena = event.get("phenomena", "")
         
-        # Filter strictly for Heat (HT) or Excessive Heat (EH)
         if phenomena not in ["HT", "EH"]:
             continue
 
@@ -130,7 +141,6 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date, county_n
             issue_dt = datetime.fromisoformat(issue_str.replace("Z", "+00:00"))
             expire_dt = datetime.fromisoformat(expire_str.replace("Z", "+00:00"))
 
-            # Check date overlap with target day
             if issue_dt <= target_end and expire_dt >= target_start:
                 significance = event.get("significance", "")
                 
@@ -139,7 +149,6 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date, county_n
                 
                 p_name = phen_map.get(phenomena, phenomena)
                 s_name = sig_map.get(significance, significance)
-                
                 area_desc = event.get("area_name", "Unknown Area")
                 
                 active_alerts.append({
@@ -167,13 +176,13 @@ st.markdown(
 
 st.divider()
 
-# Sidebar Inputs (Simple & Intuitive)
+# Sidebar Inputs
 with st.sidebar:
     st.header("Investigation Parameters")
     st.markdown("Enter the jobsite location and inspection date:")
     
-    city_input = st.text_input("City", value="Chesapeake", placeholder="e.g., Phoenix, Chesapeake")
-    state_input = st.text_input("State (Name or Abbr)", value="Virginia", placeholder="e.g., Arizona, Virginia")
+    city_input = st.text_input("City", value="Manassas", placeholder="e.g., Manassas, Houston")
+    state_input = st.text_input("State (Name or Abbr)", value="Virginia", placeholder="e.g., Virginia, TX")
     target_date = st.date_input("Incident / Inspection Date", value=datetime(2023, 7, 14))
     
     query_btn = st.button("Check Historic Alerts", type="primary", use_container_width=True)
@@ -188,9 +197,14 @@ if query_btn:
         with st.spinner("Resolving location coordinates..."):
             loc_data, geo_err = geocode_location(city_input, state_abbr)
 
-        if geo_err:
+        # Handle rate-limit gracefully without stopping execution
+        if geo_err == "WARNING_429":
+            st.warning("⚠️ OpenStreetMap rate limit reached (HTTP 429). Proceeding directly with state-wide IEM archive check.")
+        elif geo_err and loc_data is None:
             st.error(f"❌ {geo_err}")
-        else:
+            st.stop()
+
+        if loc_data:
             lat = loc_data["lat"]
             lon = loc_data["lon"]
             county = loc_data["county"]
@@ -222,7 +236,7 @@ if query_btn:
                 st.info(f"ℹ️ No weather alert records found in IEM for {state_abbr} in {year}.")
             else:
                 # Filter for active heat alerts on target date
-                df_active = filter_active_heat_alerts(raw_events, target_date, county)
+                df_active = filter_active_heat_alerts(raw_events, target_date)
 
                 st.subheader("📋 NWS Heat Advisory & Warning Audit Results")
 
