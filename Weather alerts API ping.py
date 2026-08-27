@@ -8,7 +8,7 @@ from datetime import datetime, time, timezone
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="OSHA Historic NWS Heat Alert Lookup",
-    page_icon="🩻",
+    page_icon="🤓",
     layout="wide"
 )
 
@@ -59,7 +59,6 @@ def geocode_location(city: str, state_abbr: str):
     try:
         response = requests.get(url, params=params, headers=HEADERS, timeout=8)
         
-        # Handle Rate Limiting (429) gracefully
         if response.status_code == 429:
             return {
                 "lat": 38.0, "lon": -78.0, 
@@ -83,7 +82,6 @@ def geocode_location(city: str, state_abbr: str):
         return {"lat": lat, "lon": lon, "name": display_name, "county": county}, None
 
     except requests.exceptions.RequestException as e:
-        # Fallback graceful return if network drops or times out
         return {
             "lat": 38.0, "lon": -78.0, 
             "name": f"{city.title()}, {state_abbr} (Offline Fallback)", 
@@ -118,7 +116,8 @@ def fetch_iem_state_heat_events(state_abbr: str, year: int):
 
 def filter_active_heat_alerts(events: list, target_date: datetime.date):
     """
-    Filters events active on the target date specifically for heat phenomena (HT, EH).
+    Filters events active on the target date specifically for heat phenomena 
+    including HT (Heat), EH (Excessive Heat), and XH (Extreme Heat).
     """
     active_alerts = []
     
@@ -128,7 +127,8 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date):
     for event in events:
         phenomena = event.get("phenomena", "")
         
-        if phenomena not in ["HT", "EH"]:
+        # Expanded to include modern 'XH' (Extreme Heat) alongside 'HT' and 'EH'
+        if phenomena not in ["HT", "EH", "XH"]:
             continue
 
         issue_str = event.get("issue")
@@ -141,10 +141,15 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date):
             issue_dt = datetime.fromisoformat(issue_str.replace("Z", "+00:00"))
             expire_dt = datetime.fromisoformat(expire_str.replace("Z", "+00:00"))
 
+            # Interval overlap check for multi-day alerts
             if issue_dt <= target_end and expire_dt >= target_start:
                 significance = event.get("significance", "")
                 
-                phen_map = {"HT": "Heat", "EH": "Excessive Heat"}
+                phen_map = {
+                    "HT": "Heat", 
+                    "EH": "Excessive Heat", 
+                    "XH": "Extreme Heat"
+                }
                 sig_map = {"W": "Warning", "A": "Watch", "Y": "Advisory"}
                 
                 p_name = phen_map.get(phenomena, phenomena)
@@ -181,9 +186,9 @@ with st.sidebar:
     st.header("Investigation Parameters")
     st.markdown("Enter the jobsite location and inspection date:")
     
-    city_input = st.text_input("City", value="Manassas", placeholder="e.g., Manassas, Houston")
+    city_input = st.text_input("City", value="Chesapeake", placeholder="e.g., Manassas, Houston")
     state_input = st.text_input("State (Name or Abbr)", value="Virginia", placeholder="e.g., Virginia, TX")
-    target_date = st.date_input("Incident / Inspection Date", value=datetime(2023, 7, 14))
+    target_date = st.date_input("Incident / Inspection Date", value=datetime(2026, 7, 3))
     
     query_btn = st.button("Check Historic Alerts", type="primary", use_container_width=True)
 
@@ -197,7 +202,6 @@ if query_btn:
         with st.spinner("Resolving location coordinates..."):
             loc_data, geo_err = geocode_location(city_input, state_abbr)
 
-        # Handle rate-limit gracefully without stopping execution
         if geo_err == "WARNING_429":
             st.warning("⚠️ OpenStreetMap rate limit reached (HTTP 429). Proceeding directly with state-wide IEM archive check.")
         elif geo_err and loc_data is None:
