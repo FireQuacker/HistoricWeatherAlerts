@@ -68,6 +68,7 @@ def geocode_location(city: str, state: str):
 def fetch_iem_alerts(lat: float, lon: float):
     """
     Queries historical VTEC events for a lat/lon coordinate from IEM.
+    Includes strict JSON parsing and status code validation.
     """
     url = "https://mesonet.agron.iastate.edu/json/vtec_events_by_latlon.py"
     params = {
@@ -78,19 +79,20 @@ def fetch_iem_alerts(lat: float, lon: float):
     try:
         response = requests.get(url, params=params, headers=HEADERS, timeout=15)
         
-        if response.status_code == 404:
-            return None, "IEM API endpoint not found (404). Check service availability."
-        
-        response.raise_for_status()
-        data = response.json()
-        
-        events = data.get("events", [])
-        return events, None
+        # Validate the response status code before attempting to parse JSON
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                events = data.get("events", [])
+                return events, None
+            except ValueError:
+                # Catches the "Expecting value" error when IEM returns an HTML error page
+                return None, f"Failed to parse JSON. Raw response from IEM: {response.text[:200]}"
+        else:
+            return None, f"IEM API failed with status {response.status_code}. Details: {response.text[:200]}"
 
     except requests.exceptions.RequestException as e:
         return None, f"Failed to fetch historical alerts from IEM: {str(e)}"
-    except ValueError:
-        return None, "Received an invalid JSON response from IEM server."
 
 
 def filter_heat_alerts(events: list, target_date: datetime.date):
