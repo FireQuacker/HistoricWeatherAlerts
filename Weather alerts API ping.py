@@ -1,190 +1,224 @@
-import requests
-import urllib.parse
-from datetime import datetime
-import pytz
-from timezonefinder import TimezoneFinder
 import streamlit as st
+import requests
+import pandas as pd
+from datetime import datetime, time, timezone
 
-# ==========================================
-# API UTILITIES WITH CACHING & ERROR HANDLING
-# ==========================================
+# -----------------------------------------------------------------------------
+# Configuration & Setup
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="NWS Historical Heat Alert Tracker",
+    page_icon="☀️",
+    layout="wide"
+)
+
+# Custom User-Agent to satisfy API requirements and prevent HTTP 403/404 blocks
+USER_AGENT = "StreamlitHeatAlertApp/1.0 (contact: user@example.com)"
+HEADERS = {"User-Agent": USER_AGENT}
+
+HEAT_PHENOMENA = {
+    "HT": "Heat",
+    "EH": "Excessive Heat"
+}
+
+SIGNIFICANCE_CODES = {
+    "W": "Warning",
+    "A": "Watch",
+    "Y": "Advisory",
+    "S": "Statement"
+}
+
+# -----------------------------------------------------------------------------
+# Helper Functions with Caching and Error Handling
+# -----------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def geocode_location(city: str, state: str) -> dict:
+def geocode_location(city: str, state: str):
     """
-    Geocodes a City and State using the free Nominatim (OpenStreetMap) API.
-    Cached for 1 hour to comply with OSM usage guidelines.
+    Converts City and State into Latitude and Longitude using Nominatim.
+    Includes error handling for network issues and missing locations.
     """
-    query = f"{city.strip()}, {state.strip()}, USA"
-    encoded_query = urllib.parse.quote(query)
-    url = f"https://nominatim.openstreetmap.org/search?q={encoded_query}&format=json&limit=1"
-    
-    headers = {"User-Agent": "OSHA-Historical-Heat-Checker/1.0 (Streamlit App)"}
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "city": city.strip(),
+        "state": state.strip(),
+        "country": "United States",
+        "format": "json",
+        "limit": 1
+    }
     
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, params=params, headers=HEADERS, timeout=10)
         response.raise_for_status()
         data = response.json()
         
-        if isinstance(data, list) and len(data) > 0:
-            return {
-                "latitude": float(data[0]["lat"]),
-                "longitude": float(data[0]["lon"]),
-                "display_name": data[0]["display_name"]
-            }
-        return {"error": f"No location found for '{city}, {state}'."}
+        if not data:
+            return None, "Location not found. Please verify city and state spelling."
         
-    except requests.exceptions.Timeout:
-        return {"error": "Geocoding service timed out. Please try again."}
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+        display_name = data[0].get("display_name", f"{city}, {state}")
+        return {"lat": lat, "lon": lon, "name": display_name}, None
+
     except requests.exceptions.RequestException as e:
-        return {"error": f"Geocoding network error: {e}"}
-    except (ValueError, KeyError):
-        return {"error": "Received an invalid response from the geocoding service."}
+        return None, f"Geocoding service error: {str(e)}"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def check_historical_heat_advisories(lat: float, lon: float, target_date_str: str) -> list:
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_iem_alerts(lat: float, lon: float):
     """
-    Queries the IEM API for historical alerts at a specific coordinate and filters
-    for heat events active on the target calendar date (local time).
+    Queries historical VTEC events for a lat/lon coordinate from IEM.
     """
-    # 1. Determine local timezone
-    tf = TimezoneFinder()
-    tz_name = tf.timezone_at(lng=lon, lat=lat)
-    local_tz = pytz.timezone(tz_name) if tz_name else pytz.UTC
-    
-    try:
-        target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return [{"error": f"Invalid date format: {target_date_str}. Expected YYYY-MM-DD."}]
+    url = "https://mesonet.agron.iastate.edu/json/vtec_events_by_latlon.py"
+    params = {
+        "lat": lat,
+        "lon": lon
+    }
 
-    # 2. Query the IEM Point-in-Polygon API
-    url = f"https://mesonet.agron.iastate.edu/api/1/ws.json?lat={lat}&lon={lon}"
-    
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        
+        if response.status_code == 404:
+            return None, "IEM API endpoint not found (404). Check service availability."
+        
         response.raise_for_status()
-        raw_data = response.json()
-    except requests.exceptions.Timeout:
-        return [{"error": "IEM API request timed out. Please try again."}]
-    except requests.exceptions.HTTPError as e:
-        return [{"error": f"IEM API HTTP error (Status {response.status_code}): {e}"}]
+        data = response.json()
+        
+        events = data.get("events", [])
+        return events, None
+
     except requests.exceptions.RequestException as e:
-        return [{"error": f"Failed to connect to IEM API: {e}"}]
+        return None, f"Failed to fetch historical alerts from IEM: {str(e)}"
     except ValueError:
-        return [{"error": "Invalid JSON data returned by IEM API."}]
+        return None, "Received an invalid JSON response from IEM server."
 
-    # Normalize response format (handles top-level list or dictionary wrapper)
-    if isinstance(raw_data, dict):
-        alerts = raw_data.get("data", raw_data.get("events", []))
-    elif isinstance(raw_data, list):
-        alerts = raw_data
-    else:
-        alerts = []
 
-    # 3. Filter Heat Alerts
-    heat_codes = ["HT", "EH"]
-    sig_map = {"W": "Warning", "Y": "Advisory", "A": "Watch", "S": "Statement"}
-    active_heat_events = []
+def filter_heat_alerts(events: list, target_date: datetime.date):
+    """
+    Filters VTEC event records for heat-related alerts active on the target date.
+    """
+    heat_events = []
     
-    for alert in alerts:
-        if not isinstance(alert, dict):
-            continue
-            
-        phenom = alert.get("phenomena")
-        if phenom in heat_codes:
-            issue_str = alert.get("issue")
-            expire_str = alert.get("expire")
-            
-            if not issue_str or not expire_str:
-                continue
-            
+    # Define start and end of the target day in UTC
+    target_start = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
+    target_end = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
+
+    for event in events:
+        phenomena = event.get("phenomena", "")
+        
+        # Check if the alert is heat-related (HT or EH)
+        if phenomena in HEAT_PHENOMENA:
             try:
-                # Robust ISO-8601 date parsing
-                issue_utc = datetime.fromisoformat(issue_str.replace("Z", "+00:00"))
-                expire_utc = datetime.fromisoformat(expire_str.replace("Z", "+00:00"))
+                # IEM VTEC ISO Timestamps
+                issue_str = event.get("issue")
+                expire_str = event.get("expire")
+                
+                if not issue_str or not expire_str:
+                    continue
+
+                issue_dt = datetime.fromisoformat(issue_str.replace("Z", "+00:00"))
+                expire_dt = datetime.fromisoformat(expire_str.replace("Z", "+00:00"))
+
+                # Alert was active if it overlaps with target day
+                if issue_dt <= target_end and expire_dt >= target_start:
+                    sig_code = event.get("significance", "")
+                    sig_name = SIGNIFICANCE_CODES.get(sig_code, sig_code)
+                    phen_name = HEAT_PHENOMENA.get(phenomena, phenomena)
+                    
+                    heat_events.append({
+                        "Event Type": f"{phen_name} {sig_name}",
+                        "WFO": event.get("wfo"),
+                        "Issued (UTC)": issue_dt.strftime("%Y-%m-%d %H:%M"),
+                        "Expired (UTC)": expire_dt.strftime("%Y-%m-%d %H:%M"),
+                        "Event ID": event.get("eventid"),
+                        "Phenomena": phenomena,
+                        "Significance": sig_code,
+                        "HVTEC NWS Text URL": event.get("url")
+                    })
             except ValueError:
-                continue # Skip records with unparseable timestamps
-            
-            # Convert UTC times to local time zone
-            issue_local = issue_utc.astimezone(local_tz)
-            expire_local = expire_utc.astimezone(local_tz)
-            
-            # Check if alert spans the target date
-            if issue_local.date() <= target_date <= expire_local.date():
-                sig_code = alert.get("significance", "")
-                event_type = "Excessive Heat" if phenom == "EH" else "Heat"
-                event_severity = sig_map.get(sig_code, "Alert")
-                
-                active_heat_events.append({
-                    "event_name": f"{event_type} {event_severity}",
-                    "issued_local": issue_local.strftime("%Y-%m-%d %I:%M %p %Z"),
-                    "expired_local": expire_local.strftime("%Y-%m-%d %I:%M %p %Z"),
-                    "nws_office": alert.get("wfo", "Unknown"),
-                    "event_id": alert.get("eventid", "N/A")
-                })
-                
-    return active_heat_events
+                continue
 
-# ==========================================
-# STREAMLIT USER INTERFACE
-# ==========================================
-def main():
-    st.set_page_config(page_title="Historical Heat Advisory Checker", page_icon="🚨", layout="centered")
+    return pd.DataFrame(heat_events)
+
+
+# -----------------------------------------------------------------------------
+# Streamlit UI Layout
+# -----------------------------------------------------------------------------
+st.title("☀️ NWS Historical Heat Alert Tracker")
+st.markdown(
+    "Query historical **National Weather Service (NWS)** Heat Advisories, Watches, "
+    "and Warnings powered by the **Iowa Environmental Mesonet (IEM)** archive."
+)
+
+st.divider()
+
+# Sidebar Inputs
+with st.sidebar:
+    st.header("Search Parameters")
+    city_input = st.text_input("City", value="Phoenix")
+    state_input = st.text_input("State (or abbreviation)", value="Arizona")
+    selected_date = st.date_input("Target Date", value=datetime(2023, 7, 15))
     
-    st.title("🚨 Historical Heat Advisory Checker")
-    st.markdown("Query NWS archives via the **Iowa Environmental Mesonet (IEM) API** for active heat events on a specific date.")
-    
-    with st.form("heat_search_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            city_input = st.text_input("Enter City", value="Phoenix")
-        with col2:
-            state_input = st.text_input("Enter State (e.g., AZ)", value="AZ")
-        
-        date_input = st.date_input("Select Target Date")
-        submit_button = st.form_submit_button("Search Historical Alerts")
-        
-    if submit_button:
-        if not city_input.strip() or not state_input.strip():
-            st.error("Please enter both a City and State.")
-            return
-            
-        date_str = date_input.strftime("%Y-%m-%d")
-        
-        with st.spinner("Resolving coordinates..."):
-            geo_data = geocode_location(city_input, state_input)
-            
-        if "error" in geo_data:
-            st.error(f"Geocoding Error: {geo_data['error']}")
-            return
-            
-        lat = geo_data['latitude']
-        lon = geo_data['longitude']
-        
-        st.success(f"**Location Resolved:** {geo_data['display_name']}")
-        st.caption(f"Coordinates: Latitude `{lat}`, Longitude `{lon}`")
-        
-        with st.spinner("Fetching historical NWS alerts from IEM archives..."):
-            results = check_historical_heat_advisories(lat, lon, date_str)
-            
-        st.divider()
-        
-        if len(results) > 0 and "error" in results[0]:
-            st.error(f"API Error: {results[0]['error']}")
-        elif not results:
-            st.info(f"No Heat Advisories or Excessive Heat Warnings were active for this location on **{date_str}**.")
+    search_button = st.button("Query Alerts", type="primary", use_container_width=True)
+
+# Application Logic
+if search_button:
+    if not city_input or not state_input:
+        st.warning("Please provide both a city and a state.")
+    else:
+        with st.spinner("Geocoding location..."):
+            location_data, geo_error = geocode_location(city_input, state_input)
+
+        if geo_error:
+            st.error(f"❌ {geo_error}")
         else:
-            st.warning(f"Found **{len(results)}** active heat event(s) on **{date_str}**:")
-            for event in results:
-                with st.expander(f"🚨 {event['event_name']}", expanded=True):
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.write(f"**Issued By:** NWS `{event['nws_office']}`")
-                        st.write(f"**Event ID:** `{event['event_id']}`")
-                    with col_b:
-                        st.write(f"**Active From:** {event['issued_local']}")
-                        st.write(f"**Active To:** {event['expired_local']}")
+            lat = location_data["lat"]
+            lon = location_data["lon"]
+            
+            # Display Location Summary
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.subheader("Location Metadata")
+                st.write(f"**Found Location:** {location_data['name']}")
+                st.write(f"**Coordinates:** {lat:.4f}° N, {lon:.4f}° W")
+                st.write(f"**Query Date:** {selected_date.strftime('%B %d, %Y')}")
+            
+            with col2:
+                # Interactive Map showing the point location
+                map_df = pd.DataFrame({"lat": [lat], "lon": [lon]})
+                st.map(map_df, zoom=9)
 
-if __name__ == "__main__":
-    main()
+            st.divider()
+
+            # Query IEM Alerts
+            with st.spinner("Fetching historical alert archive from IEM..."):
+                raw_events, iem_error = fetch_iem_alerts(lat, lon)
+
+            if iem_error:
+                st.error(f"❌ {iem_error}")
+            elif not raw_events:
+                st.info("ℹ️ No historical weather alert data found for these coordinates.")
+            else:
+                # Filter for heat alerts on the specified date
+                df_heat = filter_heat_alerts(raw_events, selected_date)
+
+                st.subheader(f"Heat Alerts Active on {selected_date.strftime('%Y-%m-%d')}")
+
+                if df_heat.empty:
+                    st.success("✅ No NWS Heat Advisories, Watches, or Warnings were active on this date for the selected location.")
+                else:
+                    st.warning(f"⚠️ Found {len(df_heat)} heat-related alert(s) on this date.")
+                    
+                    # Display Table
+                    display_cols = ["Event Type", "WFO", "Issued (UTC)", "Expired (UTC)", "Event ID"]
+                    st.dataframe(df_heat[display_cols], use_container_width=True)
+
+                    # Display Detailed Cards
+                    st.markdown("### Alert Breakdown")
+                    for _, row in df_heat.iterrows():
+                        with st.expander(f"📌 {row['Event Type']} (Event ID: {row['Event ID']})"):
+                            st.write(f"**Issuing Weather Forecast Office (WFO):** {row['WFO']}")
+                            st.write(f"**Issue Time:** {row['Issued (UTC)']} UTC")
+                            st.write(f"**Expiration Time:** {row['Expired (UTC)']} UTC")
+                            if row.get("HVTEC NWS Text URL"):
+                                st.markdown(f"[View IEM Text Record]({row['HVTEC NWS Text URL']})")
