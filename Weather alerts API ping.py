@@ -7,12 +7,12 @@ from datetime import datetime, time, timezone
 # Configuration & Setup
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="OSHA NWS Heat Alert Lookup",
+    page_title="OSHA Historic NWS Heat Alert Lookup",
     page_icon="🛡️",
     layout="wide"
 )
 
-# Custom User-Agent for Nominatim compliance
+# Custom User-Agent for Nominatim and IEM compliance
 USER_AGENT = "OSHA_HeatAlert_Lookup/1.0 (contact: andreodu@gmail.com)"
 HEADERS = {"User-Agent": USER_AGENT}
 
@@ -79,32 +79,34 @@ def geocode_location(city: str, state_abbr: str):
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_iem_state_heat_events(state_abbr: str, year: int):
     """
-    Fetches all Heat Advisories (HT) and Excessive Heat Warnings (EH) for a state and year from IEM.
+    Fetches all VTEC events for a state and year from IEM, 
+    avoiding API validation errors (422) by handling phenomena filtering locally.
     """
     url = "https://mesonet.agron.iastate.edu/json/vtec_events_bystate.py"
     params = {
         "state": state_abbr,
-        "year": year,
-        "phenomena": "HT,EH",
-        "fmt": "json"
+        "year": year
     }
 
     try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        response = requests.get(url, params=params, headers=HEADERS, timeout=25)
+        
         if response.status_code == 200:
             try:
                 data = response.json()
                 return data.get("vtec_events", []), None
             except ValueError:
-                return None, f"Failed to parse IEM JSON response: {response.text[:200]}"
+                return None, f"Failed to parse IEM JSON response. Raw text: {response.text[:200]}"
         else:
-            return None, f"IEM API error status {response.status_code}"
+            return None, f"IEM API error status {response.status_code} for URL: {response.url}"
+            
     except requests.exceptions.RequestException as e:
         return None, f"Network request failed: {str(e)}"
 
 def filter_active_heat_alerts(events: list, target_date: datetime.date, county_name: str):
     """
-    Filters events active on the target date and formats them for compliance review.
+    Filters events active on the target date specifically for heat phenomena (HT, EH)
+    and formats them for OSHA compliance review.
     """
     active_alerts = []
     
@@ -112,6 +114,12 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date, county_n
     target_end = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
 
     for event in events:
+        phenomena = event.get("phenomena", "")
+        
+        # Filter strictly for Heat (HT) or Excessive Heat (EH)
+        if phenomena not in ["HT", "EH"]:
+            continue
+
         issue_str = event.get("issue")
         expire_str = event.get("expire")
         
@@ -124,7 +132,6 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date, county_n
 
             # Check date overlap with target day
             if issue_dt <= target_end and expire_dt >= target_start:
-                phenomena = event.get("phenomena", "")
                 significance = event.get("significance", "")
                 
                 phen_map = {"HT": "Heat", "EH": "Excessive Heat"}
@@ -165,9 +172,9 @@ with st.sidebar:
     st.header("Investigation Parameters")
     st.markdown("Enter the jobsite location and inspection date:")
     
-    city_input = st.text_input("City", value="Phoenix", placeholder="e.g., Phoenix, Houston")
-    state_input = st.text_input("State (Name or Abbr)", value="Arizona", placeholder="e.g., Arizona, TX")
-    target_date = st.date_input("Incident / Inspection Date", value=datetime(2023, 7, 15))
+    city_input = st.text_input("City", value="Chesapeake", placeholder="e.g., Phoenix, Chesapeake")
+    state_input = st.text_input("State (Name or Abbr)", value="Virginia", placeholder="e.g., Arizona, Virginia")
+    target_date = st.date_input("Incident / Inspection Date", value=datetime(2023, 7, 14))
     
     query_btn = st.button("Check Historic Alerts", type="primary", use_container_width=True)
 
@@ -212,9 +219,9 @@ if query_btn:
             if iem_err:
                 st.error(f"❌ {iem_err}")
             elif not raw_events:
-                st.info(f"ℹ️ No heat advisory records found in IEM for {state_abbr} in {year}.")
+                st.info(f"ℹ️ No weather alert records found in IEM for {state_abbr} in {year}.")
             else:
-                # Filter for active alerts on target date
+                # Filter for active heat alerts on target date
                 df_active = filter_active_heat_alerts(raw_events, target_date, county)
 
                 st.subheader("📋 NWS Heat Advisory & Warning Audit Results")
