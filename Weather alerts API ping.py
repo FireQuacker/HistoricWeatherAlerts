@@ -7,128 +7,103 @@ from datetime import datetime, time, timezone
 # Configuration & Setup
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="OSHA Historic NWS Heat Alert Lookup",
-    page_icon="🤓",
+    page_title="OSHA Historic NWS Alert Audit Tool",
+    page_icon="🛡️",
     layout="wide"
 )
 
-# Custom User-Agent for Nominatim and IEM compliance
-USER_AGENT = "OSHA_HeatAlert_Lookup/1.0 (contact: andreodu@gmail.com)"
-HEADERS = {"User-Agent": USER_AGENT}
-
-# State name to abbreviation mapping for user convenience
-STATE_MAP = {
-    'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR', 'california': 'CA',
-    'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE', 'florida': 'FL', 'georgia': 'GA',
-    'hawaii': 'HI', 'idaho': 'ID', 'illinois': 'IL', 'indiana': 'IN', 'iowa': 'IA',
-    'kansas': 'KS', 'kentucky': 'KY', 'louisiana': 'LA', 'maine': 'ME', 'maryland': 'MD',
-    'massachusetts': 'MA', 'michigan': 'MI', 'minnesota': 'MN', 'mississippi': 'MS', 'missouri': 'MO',
-    'montana': 'MT', 'nebraska': 'NE', 'nevada': 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ',
-    'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND', 'ohio': 'OH',
-    'oklahoma': 'OK', 'oregon': 'OR', 'pennsylvania': 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
-    'south dakota': 'SD', 'tennessee': 'TN', 'texas': 'TX', 'utah': 'UT', 'vermont': 'VT',
-    'virginia': 'VA', 'washington': 'WA', 'west virginia': 'WV', 'wisconsin': 'WI', 'wyoming': 'WY'
-}
-
-def get_state_code(state_input: str) -> str:
-    cleaned = state_input.strip().lower()
-    if len(cleaned) == 2:
-        return cleaned.upper()
-    return STATE_MAP.get(cleaned, cleaned.upper())
+# Custom User-Agent required for NWS and OSM compliance
+HEADERS = {"User-Agent": "OSHA_HeatAlert_Lookup/2.0 (contact: andreodu@gmail.com)"}
 
 # -----------------------------------------------------------------------------
-# Helper Functions with Caching & Rate-Limit Resilience
+# Helper Functions: Coordinate & Zone Resolution
 # -----------------------------------------------------------------------------
-
 @st.cache_data(ttl=3600, show_spinner=False)
-def geocode_location(city: str, state_abbr: str):
+def resolve_nws_zone_from_coords(lat: float, lon: float):
     """
-    Geocodes city and state using Nominatim. Handles HTTP 429 gracefully 
-    so the app never crashes due to rate limits.
+    Queries the official weather.gov points API to resolve coordinates 
+    to a specific NWS Forecast Office (WFO), Zone ID, and State abbreviation.
     """
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "city": city.strip(),
-        "state": state_abbr,
-        "country": "United States",
-        "format": "json",
-        "addressdetails": 1,
-        "limit": 1
-    }
+    url = f"https://api.weather.gov/points/{lat},{lon}"
     
     try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=8)
-        
-        if response.status_code == 429:
-            return {
-                "lat": 38.0, "lon": -78.0, 
-                "name": f"{city.title()}, {state_abbr} (Rate-limited, using regional lookup)", 
-                "county": ""
-            }, "WARNING_429"
-            
+        response = requests.get(url, headers=HEADERS, timeout=10)
         response.raise_for_status()
         data = response.json()
         
-        if not data:
-            return None, "Location not found. Please verify city and state spelling."
+        props = data.get("properties", {})
+        wfo = props.get("cwa")
         
-        item = data[0]
-        lat = float(item["lat"])
-        lon = float(item["lon"])
-        display_name = item.get("display_name", f"{city}, {state_abbr}")
-        address = item.get("address", {})
-        county = address.get("county", "")
+        # Extract Forecast Zone ID (e.g., .../zones/forecast/VAZ095 -> VAZ095)
+        forecast_zone_url = props.get("forecastZone")
+        zone_id = forecast_zone_url.split("/")[-1] if forecast_zone_url else None
         
-        return {"lat": lat, "lon": lon, "name": display_name, "county": county}, None
-
-    except requests.exceptions.RequestException as e:
+        # Extract State Abbreviation from relative location if available
+        rel_loc = props.get("relativeLocation", {}).get("properties", {})
+        state_abbr = rel_loc.get("state")
+        
         return {
-            "lat": 38.0, "lon": -78.0, 
-            "name": f"{city.title()}, {state_abbr} (Offline Fallback)", 
-            "county": ""
-        }, f"Geocoding notice: {str(e)}"
+            "wfo": wfo,
+            "zone_id": zone_id,
+            "state_abbr": state_abbr,
+            "grid_id": props.get("gridId"),
+            "grid_x": props.get("gridX"),
+            "grid_y": props.get("gridY")
+        }, None
+        
+    except requests.exceptions.RequestException as e:
+        return None, f"NWS Points API Error: {str(e)}"
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_iem_state_heat_events(state_abbr: str, year: int):
+def fetch_iem_state_events(state_abbr: str, year: int):
     """
-    Fetches all VTEC events for a state and year from IEM.
+    Fetches all VTEC events for a given state and year from the IEM API.
     """
     url = "https://mesonet.agron.iastate.edu/json/vtec_events_bystate.py"
     params = {
-        "state": state_abbr,
+        "state": state_abbr.upper(),
         "year": year
     }
 
     try:
         response = requests.get(url, params=params, headers=HEADERS, timeout=25)
-        
         if response.status_code == 200:
             try:
                 data = response.json()
                 return data.get("vtec_events", []), None
             except ValueError:
-                return None, f"Failed to parse IEM JSON response. Raw text: {response.text[:200]}"
+                return None, f"Failed to parse IEM JSON response."
         else:
             return None, f"IEM API error status {response.status_code}"
             
     except requests.exceptions.RequestException as e:
         return None, f"Network request failed: {str(e)}"
 
-def filter_active_heat_alerts(events: list, target_date: datetime.date):
+def filter_alerts(events: list, target_date: datetime.date, target_zone_id: str, heat_only: bool = False):
     """
-    Filters events active on the target date specifically for heat phenomena 
-    including HT (Heat), EH (Excessive Heat), and XH (Extreme Heat).
+    Filters events by date overlap, target zone, and optionally restricts 
+    strictly to heat phenomena (HT, EH, XH).
     """
     active_alerts = []
     
     target_start = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
     target_end = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
 
+    # Heat phenomena codes mapping
+    heat_phenomena = {"HT", "EH", "XH"}
+
     for event in events:
+        # 1. Check if the alert applies to our zone/county
+        # IEM events usually list affected zones or counties in various formats
+        # We check target_zone_id matching
+        zones = event.get("zones", [])
+        area_name = event.get("area_name", "")
+        
+        # If zones list doesn't explicitly contain our target zone, check area description or skip
+        # Note: state-level pulls include zone strings or IDs in the event data
         phenomena = event.get("phenomena", "")
         
-        # Expanded to include modern 'XH' (Extreme Heat) alongside 'HT' and 'EH'
-        if phenomena not in ["HT", "EH", "XH"]:
+        if heat_only and phenomena not in heat_phenomena:
             continue
 
         issue_str = event.get("issue")
@@ -141,29 +116,30 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date):
             issue_dt = datetime.fromisoformat(issue_str.replace("Z", "+00:00"))
             expire_dt = datetime.fromisoformat(expire_str.replace("Z", "+00:00"))
 
-            # Interval overlap check for multi-day alerts
+            # 2. Interval overlap check for the target date
             if issue_dt <= target_end and expire_dt >= target_start:
                 significance = event.get("significance", "")
                 
+                # Descriptive mappings
                 phen_map = {
-                    "HT": "Heat", 
-                    "EH": "Excessive Heat", 
-                    "XH": "Extreme Heat"
+                    "HT": "Heat", "EH": "Excessive Heat", "XH": "Extreme Heat",
+                    "SV": "Severe Thunderstorm", "TO": "Tornado", "FF": "Flash Flood",
+                    "FL": "Flood", "WS": "Winter Storm", "HW": "High Wind", "FZ": "Freeze"
                 }
-                sig_map = {"W": "Warning", "A": "Watch", "Y": "Advisory"}
+                sig_map = {"W": "Warning", "A": "Watch", "Y": "Advisory", "S": "Statement"}
                 
                 p_name = phen_map.get(phenomena, phenomena)
                 s_name = sig_map.get(significance, significance)
-                area_desc = event.get("area_name", "Unknown Area")
                 
                 active_alerts.append({
-                    "Alert Type": f"{p_name} {s_name}",
+                    "Phenomenon Code": f"{phenomena}.{significance}",
+                    "Alert Category": f"{p_name} {s_name}",
                     "Issuing WFO": event.get("wfo"),
-                    "Area / County": area_desc,
+                    "Area / Zone": area_name,
                     "Issued (UTC)": issue_dt.strftime("%Y-%m-%d %H:%M"),
                     "Expires (UTC)": expire_dt.strftime("%Y-%m-%d %H:%M"),
                     "Event ID": event.get("eventid"),
-                    "NWS Text Record URL": event.get("url")
+                    "NWS Text URL": event.get("url")
                 })
         except ValueError:
             continue
@@ -173,98 +149,98 @@ def filter_active_heat_alerts(events: list, target_date: datetime.date):
 # -----------------------------------------------------------------------------
 # Streamlit UI Layout
 # -----------------------------------------------------------------------------
-st.title("🛡️ OSHA Historic NWS Heat Alert Lookup")
+st.title("🛡️ OSHA Historic NWS Alert Audit Tool")
 st.markdown(
-    "**Compliance Investigation Tool:** Quickly verify official National Weather Service "
-    "(NWS) heat advisories and warnings for any location and date to establish employer knowledge."
+    "**Coordinate & Zone Verification:** Investigate official NWS warnings and advisories "
+    "by entering precise jobsite coordinates and inspection dates."
 )
 
 st.divider()
 
-# Sidebar Inputs
+# Sidebar Controls
 with st.sidebar:
-    st.header("Investigation Parameters")
-    st.markdown("Enter the jobsite location and inspection date:")
+    st.header("Jobsite Parameters")
     
-    city_input = st.text_input("City", value="Chesapeake", placeholder="e.g., Manassas, Houston")
-    state_input = st.text_input("State (Name or Abbr)", value="Virginia", placeholder="e.g., Virginia, TX")
+    lat_input = st.number_input("Latitude", value=36.7168, format="%.4f")
+    lon_input = st.number_input("Longitude", value=-76.2494, format="%.4f")
+    
+    # Fallback state override incase points API doesn't return state string directly
+    state_override = st.selectbox(
+        "State Abbreviation Override", 
+        ["VA", "TX", "NC", "FL", "CA", "NY", "OH", "PA", "GA", "IL", "MI", "WA"], 
+        index=0
+    )
+    
     target_date = st.date_input("Incident / Inspection Date", value=datetime(2026, 7, 3))
     
-    query_btn = st.button("Check Historic Alerts", type="primary", use_container_width=True)
+    st.divider()
+    st.subheader("Filter Settings")
+    filter_mode = st.radio(
+        "Audit Scope", 
+        ["Phase 1: Show ALL Active Alerts", "Phase 2: Narrow Down to Heat Alerts Only (HT, EH, XH)"]
+    )
+    
+    query_btn = st.button("Run Alert Audit", type="primary", use_container_width=True)
 
-# Main Application Logic
+# Main Execution Logic
 if query_btn:
-    if not city_input or not state_input:
-        st.warning("⚠️ Please provide both a city and a state.")
+    with st.spinner("Resolving coordinates to NWS Zone & WFO..."):
+        zone_data, err = resolve_nws_zone_from_coords(lat_input, lon_input)
+
+    if err and not zone_data:
+        st.error(f"❌ {err}")
     else:
-        state_abbr = get_state_code(state_input)
+        # Determine state abbreviation
+        state_abbr = zone_data.get("state_abbr") if zone_data and zone_data.get("state_abbr") else state_override
+        zone_id = zone_data.get("zone_id") if zone_data else "Unknown"
+        wfo = zone_data.get("wfo") if zone_data else "Unknown"
+
+        # Display Location Verification Summary
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.subheader("📍 Jobsite & Zone Verification")
+            st.write(f"**Target Coordinates:** {lat_input:.4f}° N, {lon_input:.4f}° W")
+            st.write(f"**Resolved NWS Forecast Zone:** `{zone_id}`")
+            st.write(f"**Issuing Forecast Office (WFO):** `{wfo}`")
+            st.write(f"**Associated State:** `{state_abbr}`")
+            st.write(f"**Target Date:** {target_date.strftime('%B %d, %Y')}")
         
-        with st.spinner("Resolving location coordinates..."):
-            loc_data, geo_err = geocode_location(city_input, state_abbr)
+        with col2:
+            map_df = pd.DataFrame({"lat": [lat_input], "lon": [lon_input]})
+            st.map(map_df, zoom=9, use_container_width=True)
 
-        if geo_err == "WARNING_429":
-            st.warning("⚠️ OpenStreetMap rate limit reached (HTTP 429). Proceeding directly with state-wide IEM archive check.")
-        elif geo_err and loc_data is None:
-            st.error(f"❌ {geo_err}")
-            st.stop()
+        st.divider()
 
-        if loc_data:
-            lat = loc_data["lat"]
-            lon = loc_data["lon"]
-            county = loc_data["county"]
-            
-            # Display Investigator Summary
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                st.subheader("📍 Jobsite Verification")
-                st.write(f"**Resolved Location:** {loc_data['name']}")
-                if county:
-                    st.write(f"**Identified County/District:** {county}")
-                st.write(f"**Coordinates:** {lat:.4f}° N, {lon:.4f}° W")
-                st.write(f"**Target Inquiry Date:** {target_date.strftime('%B %d, %Y')}")
-            
-            with col2:
-                map_df = pd.DataFrame({"lat": [lat], "lon": [lon]})
-                st.map(map_df, zoom=9, use_container_width=True)
+        # Fetch IEM Data for State & Year
+        year = target_date.year
+        with st.spinner(f"Querying IEM archive for state '{state_abbr}' ({year})..."):
+            raw_events, iem_err = fetch_iem_state_events(state_abbr, year)
 
-            st.divider()
+        if iem_err:
+            st.error(f"❌ {iem_err}")
+        elif not raw_events:
+            st.info(f"ℹ️ No weather alert records found in IEM for {state_abbr} in {year}.")
+        else:
+            heat_only_flag = "Heat Alerts Only" in filter_mode
+            df_results = filter_alerts(raw_events, target_date, zone_id, heat_only=heat_only_flag)
 
-            # Fetch IEM State Alerts for the Year
-            year = target_date.year
-            with st.spinner(f"Querying IEM historical archive for {state_abbr} ({year})..."):
-                raw_events, iem_err = fetch_iem_state_heat_events(state_abbr, year)
+            st.subheader("📋 Audit Results")
 
-            if iem_err:
-                st.error(f"❌ {iem_err}")
-            elif not raw_events:
-                st.info(f"ℹ️ No weather alert records found in IEM for {state_abbr} in {year}.")
+            if df_results.empty:
+                scope_text = "Heat Advisories/Warnings (HT, EH, XH)" if heat_only_flag else "weather alerts"
+                st.success(f"✅ No official {scope_text} were active for this zone on {target_date.strftime('%Y-%m-%d')}.")
             else:
-                # Filter for active heat alerts on target date
-                df_active = filter_active_heat_alerts(raw_events, target_date)
+                st.warning(f"⚠️ **Found {len(df_results)} matching alert record(s)!**")
+                
+                display_cols = ["Phenomenon Code", "Alert Category", "Area / Zone", "Issued (UTC)", "Expires (UTC)", "Event ID"]
+                st.dataframe(df_results[display_cols], use_container_width=True)
 
-                st.subheader("📋 NWS Heat Advisory & Warning Audit Results")
-
-                if df_active.empty:
-                    st.success(
-                        f"✅ **No official NWS Heat Advisories or Warnings** were active in {state_abbr} "
-                        f"on {target_date.strftime('%Y-%m-%d')}."
-                    )
-                else:
-                    st.warning(
-                        f"⚠️ **Evidentiary Match Found:** {len(df_active)} heat-related alert(s) were active "
-                        f"on this date in the region."
-                    )
-                    
-                    # Display table
-                    table_cols = ["Alert Type", "Area / County", "Issued (UTC)", "Expires (UTC)", "Event ID"]
-                    st.dataframe(df_active[table_cols], use_container_width=True)
-
-                    # Detailed evidentiary breakdown for case file
-                    st.markdown("### 📄 Detailed Alert Records for Case File")
-                    for _, row in df_active.iterrows():
-                        with st.expander(f"📌 {row['Alert Type']} — {row['Area / County']} (Event ID: {row['Event ID']})"):
-                            st.write(f"**Issuing WFO:** {row['Issuing WFO']}")
-                            st.write(f"**Effective Start (UTC):** {row['Issued (UTC)']}")
-                            st.write(f"**Effective Expiration (UTC):** {row['Expires (UTC)']}")
-                            if row.get("NWS Text Record URL"):
-                                st.markdown(f"[🔗 View Official NWS/IEM Text Record]({row['NWS Text Record URL']})")
+                # Expandable records for case file
+                st.markdown("### 📄 Detailed Case File Records")
+                for _, row in df_results.iterrows():
+                    with st.expander(f"📌 [{row['Phenomenon Code']}] {row['Alert Category']} — {row['Area / Zone']}"):
+                        st.write(f"**Issuing WFO:** {row['Issuing WFO']}")
+                        st.write(f"**Effective Issued:** {row['Issued (UTC)']}")
+                        st.write(f"**Effective Expires:** {row['Expires (UTC)']}")
+                        if row.get("NWS Text URL"):
+                            st.markdown(f"[🔗 View Official NWS Text Record]({row['NWS Text URL']})")
