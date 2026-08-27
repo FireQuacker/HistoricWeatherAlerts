@@ -13,8 +13,8 @@ st.set_page_config(
 )
 
 # Custom User-Agent to satisfy API requirements and prevent HTTP 403/404 blocks
-USER_AGENT = "StreamlitHeatAlertApp/1.0 (contact: user@example.com)"
-HEADERS = {"User-Agent": USER_AGENT}
+USER_AGENT = "StreamlitHeatAlertApp/1.0 (contact: andreodu@gmail.com)"
+HEADERS = {"User-Agent": Taylor_Andre}
 
 HEAT_PHENOMENA = {
     "HT": "Heat",
